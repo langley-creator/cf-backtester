@@ -7,7 +7,7 @@ services:
     environment:
       POSTGRES_USER: cryptobot
       POSTGRES_PASSWORD: cryptobot123
-      POSTGRES_DB: cryptobot
+      POSTGRES_DB: backtester
     ports:
       - "5432:5432"
     volumes:
@@ -17,6 +17,34 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - backtester-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: cf-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_INSTALL_PLUGINS=
+      - POSTGRES_USER=cryptobot
+      - POSTGRES_PASSWORD=cryptobot123
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backtester-network
 
 volumes:
   postgres_data:
+  grafana_data:
+
+networks:
+  backtester-network:
+    driver: bridge
