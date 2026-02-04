@@ -27,15 +27,15 @@ func NewEngine(db *models.DB, strategyName string) *Engine {
 // Run executes backtesting for the specified instrument and time range
 func (e *Engine) Run(instrumentID int64, startTime, endTime time.Time) (*models.BacktestResult, error) {
 	// Load strategy configuration
-	strategy, err := e.db.GetStrategyByName(e.strategyName)
+	strat, err := e.db.GetStrategyByName(e.strategyName)
 	if err != nil {
 		return nil, err
 	}
 
 	// Initialize calculators
-	e.cfCalculator = strategy.NewCFCalculator(strategy.config)
-	e.atrCalc = strategy.NewATRCalculator(14) // Standard ATR period
-	e.adxCalc = strategy.NewADXCalculator(14) // Standard ADX period
+	e.cfCalculator = strategy.NewCFCalculator(&strat.Config)
+	e.atrCalc = strategy.NewATRCalculator(14)  // Standard ATR period
+	e.adxCalc = strategy.NewADXCalculator(14)  // Standard ADX period
 
 	// Load candles from database
 	candles, err := e.db.GetCandlesByTimeRange(instrumentID, startTime, endTime)
@@ -44,17 +44,17 @@ func (e *Engine) Run(instrumentID int64, startTime, endTime time.Time) (*models.
 	}
 
 	// Calculate indicators
-	mainCF, secondCF := e.calculateCFIndicators(candles)
+	mainCF, secondCF := e.calculateCFIndicators(candles, &strat.Config)
 	atr := e.atrCalc.Calculate(candles)
 	atrPercent := strategy.CalculateATRPercent(candles, atr)
 	adx, plusDI, minusDI := e.adxCalc.Calculate(candles)
 
 	// Execute trading logic
-	result := e.executeBacktest(candles, mainCF, secondCF, atr, atrPercent, adx, plusDI, minusDI, strategy)
+	result := e.executeBacktest(candles, mainCF, secondCF, atr, atrPercent, adx, plusDI, minusDI, &strat.Config)
 
 	// Save result to database
 	result.InstrumentID = instrumentID
-	result.StrategyID = strategy.ID
+	result.StrategyID = strat.ID
 	result.StartTime = startTime
 	result.EndTime = endTime
 	result.CreatedAt = time.Now()
@@ -67,19 +67,27 @@ func (e *Engine) Run(instrumentID int64, startTime, endTime time.Time) (*models.
 }
 
 // calculateCFIndicators computes Capital Flow indicators
-func (e *Engine) calculateCFIndicators(candles []*models.Candle) (mainCF, secondCF []float64) {
+func (e *Engine) calculateCFIndicators(candles []*models.Candle, config *models.StrategyConfig) (mainCF, secondCF []float64) {
 	mainCF = make([]float64, len(candles))
 	secondCF = make([]float64, len(candles))
 
+	prevTotalKlines := config.TotalKlines
+	prevSecondTotalKlines := config.SecondTotalKlinesMin
+	prevMainCF := 0.0
+
 	for i := range candles {
-		if i == 0 {
+		if i < config.TotalKlines {
 			continue
 		}
+
 		// Calculate MainCF
-		mainCF[i] = e.cfCalculator.CalculateMainCF(candles[:i+1], i, 0, 0)
+		mainCF[i], prevTotalKlines = e.cfCalculator.CalculateMainCF(candles, i, prevMainCF)
+		prevMainCF = mainCF[i]
 
 		// Calculate SecondCF (for visualization)
-		secondCF[i] = e.cfCalculator.CalculateSecondCF(candles[:i+1], i, 0)
+		if i > 0 && mainCF[i-1] != 0 {
+			secondCF[i], prevSecondTotalKlines = e.cfCalculator.CalculateSecondCF(candles, i, mainCF[i-1], prevSecondTotalKlines)
+		}
 	}
 
 	return mainCF, secondCF
@@ -89,7 +97,7 @@ func (e *Engine) calculateCFIndicators(candles []*models.Candle) (mainCF, second
 func (e *Engine) executeBacktest(
 	candles []*models.Candle,
 	mainCF, secondCF, atr, atrPercent, adx, plusDI, minusDI []float64,
-	strategy *models.Strategy,
+	config *models.StrategyConfig,
 ) *models.BacktestResult {
 	result := &models.BacktestResult{
 		Metrics: make(map[string]float64),
@@ -106,7 +114,7 @@ func (e *Engine) executeBacktest(
 
 		// Check for entry signal
 		if currentPosition == nil {
-			signal := e.checkEntrySignal(i, mainCF, secondCF, adx, plusDI, minusDI, atrPercent, strategy)
+			signal := e.checkEntrySignal(i, mainCF, secondCF, adx, plusDI, minusDI, atrPercent, config)
 			if signal != "" {
 				currentPosition = e.openPosition(signal, candle, atr[i], currentBalance)
 				if currentPosition != nil {
@@ -118,10 +126,12 @@ func (e *Engine) executeBacktest(
 			if e.checkExitSignal(i, currentPosition, candle, atr[i]) {
 				trade := e.closePosition(currentPosition, candle)
 				currentBalance += trade.ExitPrice * currentPosition.Size
+
 				trade.PnL = (trade.ExitPrice - trade.EntryPrice) * currentPosition.Size
 				if currentPosition.Side == "SHORT" {
 					trade.PnL = -trade.PnL
 				}
+
 				trades = append(trades, trade)
 				currentPosition = nil
 			}
@@ -133,10 +143,12 @@ func (e *Engine) executeBacktest(
 		lastCandle := candles[len(candles)-1]
 		trade := e.closePosition(currentPosition, lastCandle)
 		currentBalance += trade.ExitPrice * currentPosition.Size
+
 		trade.PnL = (trade.ExitPrice - trade.EntryPrice) * currentPosition.Size
 		if currentPosition.Side == "SHORT" {
 			trade.PnL = -trade.PnL
 		}
+
 		trades = append(trades, trade)
 	}
 
@@ -148,19 +160,19 @@ func (e *Engine) executeBacktest(
 
 // Position represents an open trading position
 type Position struct {
-	Side       string
-	EntryPrice float64
-	EntryTime  time.Time
-	Size       float64
-	StopLoss   float64
-	TakeProfit float64
+	Side        string
+	EntryPrice  float64
+	EntryTime   time.Time
+	Size        float64
+	StopLoss    float64
+	TakeProfit  float64
 }
 
 // checkEntrySignal determines if entry conditions are met
 func (e *Engine) checkEntrySignal(
 	idx int,
 	mainCF, secondCF, adx, plusDI, minusDI, atrPercent []float64,
-	strategy *models.Strategy,
+	config *models.StrategyConfig,
 ) string {
 	if idx < 2 {
 		return ""
@@ -168,14 +180,14 @@ func (e *Engine) checkEntrySignal(
 
 	// Long signal: MainCF crosses above 0, ADX > threshold, +DI > -DI
 	if mainCF[idx] > 0 && mainCF[idx-1] <= 0 {
-		if adx[idx] > strategy.Config.ADXThreshold && plusDI[idx] > minusDI[idx] {
+		if adx[idx] > config.ADXThreshold && plusDI[idx] > minusDI[idx] {
 			return "LONG"
 		}
 	}
 
 	// Short signal: MainCF crosses below 0, ADX > threshold, -DI > +DI
 	if mainCF[idx] < 0 && mainCF[idx-1] >= 0 {
-		if adx[idx] > strategy.Config.ADXThreshold && minusDI[idx] > plusDI[idx] {
+		if adx[idx] > config.ADXThreshold && minusDI[idx] > plusDI[idx] {
 			return "SHORT"
 		}
 	}
@@ -217,6 +229,7 @@ func (e *Engine) checkExitSignal(idx int, position *Position, candle *models.Can
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -252,6 +265,7 @@ func (e *Engine) closePosition(position *Position, candle *models.Candle) *model
 // calculateMetrics computes performance metrics
 func (e *Engine) calculateMetrics(result *models.BacktestResult, trades []*models.Trade, initialBalance, finalBalance float64) {
 	result.TotalTrades = len(trades)
+
 	if result.TotalTrades == 0 {
 		return
 	}
